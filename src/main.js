@@ -1,184 +1,145 @@
 import "./styles.css";
+import { Repo } from "./model/repo.js";
+import { MemoryStorage } from "./model/store.js";
+import { dashboardStats } from "./model/query.js";
+import { toDatetimeLocalInput } from "./model/util.js";
+import { addBuilding, addRoom, addDevice, addWorker, createOrderSafe } from "./model/seed.js";
+import { renderStats } from "./ui/stats.js";
+import { renderList, bindList } from "./ui/list.js";
+import { openNewOrder } from "./ui/order-form.js";
+import { openOrderDetail } from "./ui/order-detail.js";
+import { openRegistry } from "./ui/registry.js";
+import { openBackup } from "./ui/backup.js";
+import { toast } from "./ui/widgets.js";
 
-const STORAGE_KEY = "zfl-14-repairs";
-const statuses = {
-  all: "全部",
-  todo: "待处理",
-  doing: "处理中",
-  done: "已完成"
-};
+const FILTER_KEY = "prd:ui:v1";
 
-const priorities = {
-  high: "高优先级",
-  medium: "中优先级",
-  low: "低优先级"
-};
+class AppUI {
+  constructor() {
+    this.criteria = { buildingId: "", status: "", priority: "", assigneeId: "", keyword: "" };
+    this.sort = { by: "visitAt", dir: "asc" };
+    this.load();
+  }
+  load() {
+    try {
+      const raw = JSON.parse(localStorage.getItem(FILTER_KEY) || "null");
+      if (raw) {
+        this.criteria = { ...this.criteria, ...(raw.criteria || {}) };
+        this.sort = { ...this.sort, ...(raw.sort || {}) };
+      }
+    } catch { /* 忽略损坏的 UI 偏好 */ }
+  }
+  save() {
+    localStorage.setItem(FILTER_KEY, JSON.stringify({ criteria: this.criteria, sort: this.sort }));
+  }
+  reset() {
+    this.criteria = { buildingId: "", status: "", priority: "", assigneeId: "", keyword: "" };
+    this.sort = { by: "visitAt", dir: "asc" };
+    this.save();
+  }
+}
 
-let state = loadState();
+function chooseStorage() {
+  try {
+    const probe = "__prd_probe__";
+    localStorage.setItem(probe, "1");
+    localStorage.removeItem(probe);
+    return localStorage;
+  } catch {
+    return new MemoryStorage();
+  }
+}
+
+const storage = chooseStorage();
+const repo = new Repo({ storage });
+
+// 首次使用：写入演示基础数据，便于直接体验（可在备份中心清空/覆盖）
+if (repo.data.buildings.length === 0 && repo.data.orders.length === 0) {
+  seedDemo(repo, storage);
+}
+
+if (repo.loadInfo.source === "snapshot") {
+  setTimeout(() => toast(`检测到本地数据损坏，已自动回退到 ${new Date(repo.loadInfo.snapshotAt).toLocaleString()} 的快照`, "error"), 400);
+} else if (repo.loadInfo.source === "empty" && repo.loadInfo.error) {
+  setTimeout(() => toast("本地数据损坏且无可用快照，已使用空库启动", "error"), 400);
+}
+
+const ui = new AppUI();
 const app = document.querySelector("#app");
 
-function loadState() {
-  const saved = localStorage.getItem(STORAGE_KEY);
-  if (saved) return JSON.parse(saved);
-  return {
-    filter: "all",
-    repairs: [
-      {
-        id: crypto.randomUUID(),
-        location: "厨房",
-        title: "水槽下方渗水",
-        priority: "high",
-        cost: 260,
-        status: "todo",
-        photo: "",
-        note: "先检查软管接口"
-      }
-    ]
-  };
-}
-
-function saveState() {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
-}
+const ctx = {
+  repo,
+  ui,
+  now: () => Date.now(),
+  rerender: render,
+  openOrder: (id) => openOrderDetail(ctx, id)
+};
 
 function render() {
-  const repairs = filteredRepairs();
-  const unfinished = state.repairs.filter((repair) => repair.status !== "done");
-  const totalCost = unfinished.reduce((total, repair) => total + Number(repair.cost || 0), 0);
-  const doing = state.repairs.filter((repair) => repair.status === "doing").length;
-
+  const stats = dashboardStats(repo.data, ctx.now());
   app.innerHTML = `
     <main class="shell">
-      <header class="header">
-        <div>
-          <p class="eyebrow">本地家庭维护台</p>
-          <h1>家庭维修事项</h1>
+      <header class="topbar">
+        <div class="brand">
+          <h1>物业维修派单台</h1>
+          <span class="muted">离线版 · 数据仅存本机浏览器</span>
         </div>
-        <section class="stats">
-          <div class="stat"><span>未完成</span><strong>${unfinished.length}</strong></div>
-          <div class="stat"><span>处理中</span><strong>${doing}</strong></div>
-          <div class="stat"><span>预计费用</span><strong>¥${totalCost}</strong></div>
-        </section>
+        <nav class="top-actions">
+          <button class="btn btn-primary" id="btn-new">＋ 新建维修单</button>
+          <button class="btn" id="btn-registry">登记管理</button>
+          <button class="btn" id="btn-backup">备份与恢复</button>
+        </nav>
       </header>
+      ${renderStats(stats)}
+      <main class="content">${renderList(ctx)}</main>
+      <footer class="footer muted">待派单 → 已接单 → 维修中 → 待验收 → 已验收；验收不通过退回已接单。</footer>
+    </main>`;
 
-      <section class="layout">
-        <aside class="panel">
-          <h2>新增维修事项</h2>
-          <form class="form" id="repair-form">
-            <label>位置<input name="location" required placeholder="例如卫生间"></label>
-            <label>问题描述<textarea name="title" required placeholder="例如门锁松动"></textarea></label>
-            <label>优先级<select name="priority">${renderPriorityOptions("medium")}</select></label>
-            <label>预计费用<input name="cost" type="number" min="0" step="1" value="0"></label>
-            <label>处理状态<select name="status">${renderStatusOptions("todo")}</select></label>
-            <label>照片链接<input name="photo" type="url" placeholder="可选，粘贴图片地址"></label>
-            <label>备注<textarea name="note" placeholder="师傅电话、材料或注意事项"></textarea></label>
-            <button class="primary" type="submit">保存事项</button>
-          </form>
-        </aside>
-
-        <section>
-          <div class="toolbar">
-            ${Object.entries(statuses).map(([value, label]) => `<button class="seg ${state.filter === value ? "active" : ""}" data-filter="${value}">${label}</button>`).join("")}
-          </div>
-          <div class="repairs">
-            ${repairs.length ? repairs.map(renderRepair).join("") : `<div class="empty">当前状态下没有维修事项</div>`}
-          </div>
-        </section>
-      </section>
-    </main>
-  `;
-
-  bindEvents();
+  document.getElementById("btn-new").addEventListener("click", () => openNewOrder(ctx));
+  document.getElementById("btn-registry").addEventListener("click", () => openRegistry(ctx));
+  document.getElementById("btn-backup").addEventListener("click", () => openBackup(ctx));
+  bindList(ctx);
 }
 
-function renderRepair(repair) {
-  return `
-    <article class="repair">
-      <div class="photo">${repair.photo ? `<img src="${escapeHtml(repair.photo)}" alt="${escapeHtml(repair.location)}维修照片">` : "未添加照片"}</div>
-      <div class="content">
-        <div class="row">
-          <h3>${escapeHtml(repair.location)}</h3>
-          <span class="priority ${repair.priority}">${priorities[repair.priority]}</span>
-          <span class="status ${repair.status}">${statuses[repair.status]}</span>
-        </div>
-        <p>${escapeHtml(repair.title)}</p>
-        <div class="row">
-          <span class="chip">预计 ¥${Number(repair.cost || 0)}</span>
-          <span class="chip">${escapeHtml(repair.note || "暂无备注")}</span>
-        </div>
-        <div class="actions">
-          <select data-status="${repair.id}">${renderStatusOptions(repair.status)}</select>
-          <button class="ghost" data-delete="${repair.id}">删除</button>
-        </div>
-      </div>
-    </article>
-  `;
-}
+function seedDemo(repoInstance, store) {
+  // 用空数据建好后直接持久化，避免 demo 数据与真实数据混淆
+  const b1 = addBuilding(repoInstance.data, { name: "1栋" });
+  const b2 = addBuilding(repoInstance.data, { name: "2栋" });
+  const r1 = addRoom(repoInstance.data, { buildingId: b1.id, name: "301", ownerName: "王女士", phone: "13800000001" });
+  const r2 = addRoom(repoInstance.data, { buildingId: b1.id, name: "502", ownerName: "李先生", phone: "13800000002" });
+  const r3 = addRoom(repoInstance.data, { buildingId: b2.id, name: "101", ownerName: "赵先生", phone: "13800000003" });
+  addDevice(repoInstance.data, { name: "空调", brand: "通用", defaultPrice: 300 });
+  addDevice(repoInstance.data, { name: "水管", brand: "PPR", defaultPrice: 25 });
+  addDevice(repoInstance.data, { name: "门锁", brand: "", defaultPrice: 120 });
+  const w1 = addWorker(repoInstance.data, { name: "张师傅", trade: "水电", phone: "13900000001" });
+  const w2 = addWorker(repoInstance.data, { name: "陈师傅", trade: "综合", phone: "13900000002" });
 
-function renderStatusOptions(selected) {
-  return Object.entries(statuses)
-    .filter(([value]) => value !== "all")
-    .map(([value, label]) => `<option value="${value}" ${selected === value ? "selected" : ""}>${label}</option>`)
-    .join("");
-}
-
-function renderPriorityOptions(selected) {
-  return Object.entries(priorities)
-    .map(([value, label]) => `<option value="${value}" ${selected === value ? "selected" : ""}>${label}</option>`)
-    .join("");
-}
-
-function bindEvents() {
-  document.querySelector("#repair-form").addEventListener("submit", (event) => {
-    event.preventDefault();
-    const data = Object.fromEntries(new FormData(event.target));
-    state.repairs.unshift({
-      id: crypto.randomUUID(),
-      location: data.location.trim(),
-      title: data.title.trim(),
-      priority: data.priority,
-      cost: Number(data.cost || 0),
-      status: data.status,
-      photo: data.photo.trim(),
-      note: data.note.trim()
-    });
-    saveState();
-    render();
-  });
-
-  document.querySelectorAll("[data-filter]").forEach((button) => {
-    button.addEventListener("click", () => {
-      state.filter = button.dataset.filter;
-      saveState();
-      render();
-    });
-  });
-
-  document.querySelectorAll("[data-status]").forEach((select) => {
-    select.addEventListener("change", () => {
-      const repair = state.repairs.find((item) => item.id === select.dataset.status);
-      repair.status = select.value;
-      saveState();
-      render();
-    });
-  });
-
-  document.querySelectorAll("[data-delete]").forEach((button) => {
-    button.addEventListener("click", () => {
-      state.repairs = state.repairs.filter((repair) => repair.id !== button.dataset.delete);
-      saveState();
-      render();
-    });
-  });
-}
-
-function filteredRepairs() {
-  if (state.filter === "all") return state.repairs;
-  return state.repairs.filter((repair) => repair.status === state.filter);
-}
-
-function escapeHtml(value) {
-  return String(value).replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" })[char]);
+  const now = Date.now();
+  const HOUR = 3600_000;
+  const visitLocal = (offset) => toDatetimeLocalInput(new Date(now + offset));
+  createOrderSafe(repoInstance.data, {
+    roomId: r1.id, title: "厨房水槽下渗水", priority: "high",
+    budget: 400, visitAt: visitLocal(-26 * HOUR),
+    assigneeId: w1.id, advance: ["accepted", "repairing"],
+    workHours: 1.5, materials: [{ name: "PPR 弯头", qty: 2, price: 12 }]
+  }, now);
+  createOrderSafe(repoInstance.data, {
+    roomId: r2.id, title: "卧室空调不制冷", priority: "medium",
+    budget: 300, visitAt: visitLocal(-2 * HOUR),
+    assigneeId: w2.id, advance: ["accepted", "repairing", "accepting_check"],
+    workHours: 2, hourlyRate: 90, materials: [{ name: "制冷剂", qty: 1, price: 220 }]
+  }, now);
+  createOrderSafe(repoInstance.data, {
+    roomId: r3.id, title: "入户门门锁松动", priority: "low",
+    budget: 200, visitAt: visitLocal(24 * HOUR)
+  }, now);
+  createOrderSafe(repoInstance.data, {
+    roomId: r2.id, title: "走廊吸顶灯不亮", priority: "low",
+    budget: 150, visitAt: visitLocal(-50 * HOUR),
+    assigneeId: w2.id, advance: ["accepted", "repairing", "accepting_check", "verified"],
+    workHours: 1, hourlyRate: 80, materials: [{ name: "LED 灯盘", qty: 1, price: 35 }]
+  }, now);
+  store.save(repoInstance.data);
 }
 
 render();
