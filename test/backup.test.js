@@ -145,6 +145,122 @@ test("手动回退到指定快照", () => {
   assert.equal(reopened.data.orders.length, 1);
 });
 
+test("手动回退：回到的是所选（非最新）快照，且当前状态先留档可再回退", () => {
+  const { repo, ids, tick } = setupRepo();
+  // 快照保存的是「每次保存之前」的状态：
+  //   保存 o2 时推入含 o1 的快照；保存 o3 时推入含 o1+o2 的快照
+  const o1 = makeOrder(repo, ids.room1, { title: "第一单" });
+  tick(1000);
+  const o2 = makeOrder(repo, ids.room2, { title: "第二单" });
+  tick(1000);
+  const snapA = repo.listSnapshots().at(-1).id; // 含 o1，不含 o2
+  const o3 = makeOrder(repo, ids.room3, { title: "第三单" });
+  const snapB = repo.listSnapshots().at(-1).id; // 含 o1+o2，不含 o3
+  assert.equal(repo.data.orders.length, 3);
+  assert.equal(repo.listSnapshots().find((s) => s.id === snapA).data.orders.length, 1);
+  assert.equal(repo.listSnapshots().find((s) => s.id === snapB).data.orders.length, 2);
+
+  // 明确选择较早的 snapA（而非最新快照），必须回到只有 o1 的状态
+  repo.rollback(snapA);
+  assert.deepEqual(repo.data.orders.map((o) => o.id), [o1.id]);
+
+  // 回退前当前状态已留档：快照环新增一份含 3 单的快照，可再退回
+  const threeOrderSnap = [...repo.listSnapshots()].reverse().find((s) => s.data.orders.length === 3);
+  assert.ok(threeOrderSnap, "回退操作应先把当前 3 单状态推入快照环");
+  repo.rollback(threeOrderSnap.id);
+  assert.equal(repo.data.orders.length, 3);
+  assert.ok(repo.data.orders.find((o) => o.id === o3.id));
+
+  // 选不存在的快照 id 报明确错误
+  assert.throws(() => repo.rollback("no-such-id"), (e) => e.code === "SNAPSHOT_NOT_FOUND");
+});
+
+test("手动回退：所选快照本身损坏时拒绝并保留当前数据", () => {
+  const { repo, ids, storage } = setupRepo();
+  makeOrder(repo, ids.room1, { title: "第一单" });
+  makeOrder(repo, ids.room2, { title: "第二单" });
+  const target = repo.listSnapshots().at(-1);
+  const list = JSON.parse(storage.getItem("prd:snapshots:v1"));
+  list.find((s) => s.id === target.id).data = "{corrupt";
+  storage.setItem("prd:snapshots:v1", JSON.stringify(list));
+
+  assert.throws(() => repo.rollback(target.id), (e) => e.code === "SNAPSHOT_CORRUPT");
+  assert.equal(repo.data.orders.length, 2, "回退失败不得改动当前内存数据");
+});
+
+test("主数据可解析但结构残缺（缺集合字段）：回退最近完好快照而非清空", () => {
+  const { repo, storage, ids } = setupRepo();
+  const o = makeOrder(repo, ids.room1, { title: "重要工单" });
+  repo.editOrder(o.id, { budget: 123 }); // 再保存一次，使含工单的状态进入快照
+
+  // 残缺对象：能 JSON.parse、是对象，但没有 buildings/orders 等数组
+  storage.setItem("prd:data:v1", JSON.stringify({ hello: "world" }));
+
+  const reopened = new Repo({ storage });
+  assert.equal(reopened.loadInfo.source, "snapshot");
+  assert.equal(reopened.data.orders.length, 1);
+  assert.equal(reopened.data.orders[0].title, "重要工单");
+  assert.ok(reopened.data.buildings.length >= 1);
+  assert.match(reopened.loadInfo.error, /结构/);
+
+  // 再次刷新仍读到已恢复的主数据
+  const again = new Repo({ storage });
+  assert.equal(again.loadInfo.source, "live");
+  assert.equal(again.data.orders.length, 1);
+});
+
+test("主数据结构残缺的各种形态都触发快照回退", () => {
+  const cases = [
+    "{}",
+    "null",
+    "[]",
+    "42",
+    JSON.stringify({ buildings: [], rooms: [], devices: [], workers: [] }), // 缺 orders
+    JSON.stringify({ buildings: [], rooms: [], devices: [], workers: [], orders: "x" }) // orders 非数组
+  ];
+  for (const corrupted of cases) {
+    const { repo, storage, ids } = setupRepo();
+    makeOrder(repo, ids.room1, { title: "x" });
+    repo.editOrder(repo.data.orders[0].id, { budget: 1 });
+    storage.setItem("prd:data:v1", corrupted);
+    const reopened = new Repo({ storage });
+    assert.equal(reopened.loadInfo.source, "snapshot", `应回退快照: ${corrupted}`);
+    assert.equal(reopened.data.orders.length, 1, `数据应保留: ${corrupted}`);
+  }
+});
+
+test("主数据结构残缺且全部快照也不可用：才进入空库", () => {
+  const { repo, storage, ids } = setupRepo();
+  makeOrder(repo, ids.room1);
+  storage.setItem("prd:data:v1", "{}"); // 结构残缺
+  storage.setItem("prd:snapshots:v1", "[{bad"); // 快照链整体损坏
+
+  const reopened = new Repo({ storage });
+  assert.equal(reopened.loadInfo.source, "empty");
+  assert.ok(reopened.loadInfo.error);
+  assert.equal(reopened.data.orders.length, 0);
+});
+
+test("恢复后日常流程不受影响：可继续建单/派单/流转并持久化", () => {
+  const { repo, storage, ids } = setupRepo();
+  const o = makeOrder(repo, ids.room1, { title: "恢复后继续用" });
+  repo.editOrder(o.id, { budget: 100 });
+  storage.setItem("prd:data:v1", JSON.stringify({ bogus: true }));
+
+  const reopened = new Repo({ storage });
+  assert.equal(reopened.loadInfo.source, "snapshot");
+  // 在恢复出的数据上继续日常操作
+  reopened.dispatch(o.id, { assigneeId: ids.w1 });
+  reopened.advance(o.id, "repairing");
+  reopened.saveWorkReport(o.id, { workHours: 1, materials: [{ name: "管件", qty: 2, price: 10 }] });
+
+  const again = new Repo({ storage });
+  assert.equal(again.loadInfo.source, "live", "新写入的数据应作为正常主数据被读取");
+  const order = again.data.orders[0];
+  assert.equal(order.status, "repairing");
+  assert.equal(order.total, 100);
+});
+
 test("刷新不丢：同存储重新实例化数据完整", () => {
   const storage = new MemoryStorage();
   const { repo, ids } = setupRepo({ storage });

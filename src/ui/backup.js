@@ -105,7 +105,7 @@ export function openBackup(ctx) {
       const snapshotId = btn.dataset.rollback;
       if (!confirm("确定回退到该快照？当前数据会先留存一份快照。")) return;
       try {
-        repo.rollback(savedAt);
+        repo.rollback(snapshotId);
         toast("已回退", "success");
         modal.close();
         ctx.rerender();

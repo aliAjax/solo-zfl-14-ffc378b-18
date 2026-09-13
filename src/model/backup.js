@@ -16,6 +16,15 @@ function isObject(v) {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
+const REQUIRED_ARRAYS = ["buildings", "rooms", "devices", "workers", "orders"];
+
+// 轻量结构校验：主数据必须是对象且五个集合字段都是数组。
+// 不校验引用完整性（删除楼栋/房间后工单残留旧 id 属合法场景，UI 降级显示「未知房间」）。
+export function hasValidShape(parsed) {
+  if (!isObject(parsed)) return false;
+  return REQUIRED_ARRAYS.every((key) => Array.isArray(parsed[key]));
+}
+
 // 结构校验：只验证整体形状与主键完整性，字段级清洗由 normalizeOrder 完成
 export function validateData(parsed) {
   const errors = [];
